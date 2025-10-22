@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>QQQ — 1-minute Derivative (USD·min⁻¹)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      margin: 16px;
+      background: #f7f9fc;
+      color: #111;
+    }
+    header {
+      margin-bottom: 8px;
+    }
+    h1 { font-size: 18px; margin: 0 0 8px 0; }
+    #chartContainer {
+      width: 100%;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    canvas { background: #ffffff; border: 1px solid #e0e6ef; box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
+    #status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #333;
+    }
+    .meta {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #444;
+    }
+    .small {
+      font-size: 12px;
+      color: #666;
+    }
+    #controls { margin-top: 10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button { padding: 6px 10px; font-size:13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>QQQ — 1-minute derivative (USD·min⁻¹)</h1>
+    <div class="small">Derivative computed as [P(t) − P(t − 60 s)] / 60. Requires a finnhub API key.</div>
+  </header>
+
+  <div id="chartContainer">
+    <canvas id="derivChart" height="300"></canvas>
+    <div id="status">Initializing...</div>
+    <div class="meta">
+      <strong>Data source:</strong> finnhub WebSocket (realtime trades). Replace token below. &nbsp;
+      <strong>Sampling window:</strong> 60 seconds. &nbsp;
+      <strong>Units:</strong> USD per minute.
+    </div>
+    <div id="controls">
+      <button id="btnPause">Pause</button>
+      <button id="btnClear">Clear</button>
+      <label style="display:inline-flex;align-items:center;gap:6px;">
+        <input id="smoothToggle" type="checkbox" /> apply 5-point smoothing
+      </label>
+    </div>
+  </div>
+
+<script>
+/* ============================
+   Configuration (edit token)
+   ============================ */
+const FINNHUB_API_KEY = "d3s3fqpr01qldtrbp1a0d3s3fqpr01qldtrbp1ag"; // <<--- replace with your finnhub token
+const SYMBOL = "QQQ";       // symbol to subscribe (QQQ)
+const WINDOW_SECONDS = 60;  // derivative window (1 minute)
+
+/* ============================
+   Runtime data structures
+   ============================ */
+// Maintain buffer of {t: unix_seconds, p: price}
+const priceBuffer = []; // ascending by time
+const derivativeSeries = []; // {t: Date, v: derivative}
+
+/* Helper: push price into buffer and prune old samples (keep a bit extra) */
+function pushPrice(unixSec, price) {
+  // maintain ascending times
+  if (priceBuffer.length === 0 || unixSec >= priceBuffer[priceBuffer.length-1].t) {
+    priceBuffer.push({t: unixSec, p: price});
+  } else {
+    // rare: out-of-order tick; insert appropriately
+    let i = priceBuffer.findIndex(x => x.t > unixSec);
+    if (i === -1) priceBuffer.push({t: unixSec, p: price});
+    else priceBuffer.splice(i, 0, {t: unixSec, p: price});
+  }
+  // prune older than WINDOW_SECONDS * 3 (keep some history for interpolation)
+  const cutoff = unixSec - WINDOW_SECONDS * 3;
+  while (priceBuffer.length && priceBuffer[0].t < cutoff) priceBuffer.shift();
+}
+
+/* Interpolate price at a target unix time using linear interpolation.
+   Returns null if cannot interpolate (insufficient data). */
+function priceAt(unixTarget) {
+  if (priceBuffer.length === 0) return null;
+  // if target out of range
+  if (unixTarget <= priceBuffer[0].t) {
+    if (Math.abs(unixTarget - priceBuffer[0].t) < 1.0) return priceBuffer[0].p;
+    return null;
+  }
+  if (unixTarget >= priceBuffer[priceBuffer.length-1].t) {
+    if (Math.abs(unixTarget - priceBuffer[priceBuffer.length-1].t) < 1.0) return priceBuffer[priceBuffer.length-1].p;
+    return null;
+  }
+  // find neighbors
+  for (let i=0; i<priceBuffer.length-1; ++i) {
+    const a = priceBuffer[i], b = priceBuffer[i+1];
+    if (a.t <= unixTarget && unixTarget <= b.t) {
+      if (b.t === a.t) return a.p;
+      const w = (unixTarget - a.t) / (b.t - a.t);
+      return a.p + w * (b.p - a.p);
+    }
+  }
+  return null;
+}
+
+/* Compute derivative at current time using P(t) and P(t - WINDOW_SECONDS) */
+function computeDerivativeForNow(unixNow) {
+  const pNow = priceAt(unixNow);
+  const pPast = priceAt(unixNow - WINDOW_SECONDS);
+  if (pNow == null || pPast == null) return null;
+  // delta price per second
+  const deltaPricePerSec = (pNow - pPast) / WINDOW_SECONDS;
+  // convert to USD per minute
+  return deltaPricePerSec * 60.0;
+}
+
+/* Optional smoothing: simple moving average over last N values */
+function smoothRecent(values, N=5) {
+  if (!values || values.length === 0) return values;
+  const out = [];
+  for (let i=0;i<values.length;i++) {
+    let start = Math.max(0, i - (N-1));
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j<=i; j++) { sum += values[j].v; count++; }
+    out.push({t: values[i].t, v: sum / count});
+  }
+  return out;
+}
+
+/* ============================
+   Chart setup (Chart.js)
+   ============================ */
+const ctx = document.getElementById('derivChart').getContext('2d');
+const chartData = {
+  datasets: [{
+    label: '1-minute derivative (USD·min⁻¹)',
+    data: [], // {x: Date, y: value}
+    borderWidth: 1.5,
+    pointRadius: 0,
+    tension: 0.15,
+    borderColor: '#1f77b4',
+  }]
+};
+
+const derivChart = new Chart(ctx, {
+  type: 'line',
+  data: chartData,
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+      x: {
+        type: 'time',
+        time: { unit: 'second', tooltipFormat: 'HH:mm:ss' },
+        title: { display: true, text: 'Time (UTC)' }
+      },
+      y: {
+        title: { display: true, text: 'USD per minute' },
+        ticks: { callback: v => v.toFixed(4) }
+      }
+    },
+    plugins: {
+      legend: { display: true },
+      tooltip: {
+        callbacks: {
+          label: ctx => `${ctx.formattedValue} USD·min⁻¹`
+        }
+      }
+    }
+  }
+});
+
+/* Utility: push a derivative point to chart and keep window */
+function pushDerivativePoint(timeDate, value) {
+  chartData.datasets[0].data.push({x: timeDate, y: value});
+  // keep recent 30 minutes in chart (adjustable)
+  const cutoff = Date.now() - (30 * 60 * 1000);
+  while (chartData.datasets[0].data.length && chartData.datasets[0].data[0].x < cutoff) {
+    chartData.datasets[0].data.shift();
+  }
+  derivChart.update('none');
+}
+
+/* ============================
+   WebSocket to finnhub (realtime)
+   ============================ */
+const statusEl = document.getElementById('status');
+let ws = null;
+let paused = false;
+
+function setStatus(txt) { statusEl.textContent = txt; }
+
+function startWebSocket() {
+  if (!FINNHUB_API_KEY || FINNHUB_API_KEY.includes("YOUR_FINNHUB")) {
+    setStatus("Please set FINNHUB_API_KEY in the script before running.");
+    return;
+  }
+  const url = `wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setStatus("WebSocket connected, subscribing to " + SYMBOL);
+    // subscribe trade feed for the symbol
+    ws.send(JSON.stringify({type: "subscribe", symbol: SYMBOL}));
+  };
+
+  ws.onmessage = (evt) => {
+    if (paused) return;
+    try {
+      const msg = JSON.parse(evt.data);
+      // finnhub trade messages: { 'data': [{ 's': 'TICKER', 'p': price, 't': epoch_ms, 'v': size }], 'type': 'trade' }
+      if (msg.type === 'trade' && Array.isArray(msg.data)) {
+        for (const tick of msg.data) {
+          // tick.t is ms epoch
+          const unixSec = Math.floor(tick.t / 1000);
+          const price = Number(tick.p);
+          if (!isFinite(price)) continue;
+          pushPrice(unixSec, price);
+          // we compute derivative using current unixSec
+          const deriv = computeDerivativeForNow(unixSec);
+          if (deriv != null) {
+            const timeDate = new Date(unixSec * 1000);
+            derivativeSeries.push({t: timeDate, v: deriv});
+            // optionally smooth last N before pushing to chart
+            const smoothToggle = document.getElementById('smoothToggle').checked;
+            if (smoothToggle) {
+              const sm = smoothRecent(derivativeSeries, 5);
+              pushDerivativePoint(sm[sm.length-1].t, sm[sm.length-1].v);
+            } else {
+              pushDerivativePoint(timeDate, deriv);
+            }
+            setStatus(`Last price: $${price.toFixed(4)}  | derivative: ${deriv.toFixed(6)} USD·min⁻¹`);
+          } else {
+            setStatus(`Last price: $${price.toFixed(4)}  | waiting for ${WINDOW_SECONDS}s history to compute derivative`);
+          }
+        }
+      } else if (msg.type === 'ping') {
+        // ignore
+      } else {
+        // any other message
+        // console.log("ws-msg", msg);
+      }
+    } catch (err) {
+      console.error("ws parse err", err);
+    }
+  };
+
+  ws.onerror = (e) => {
+    console.error("WebSocket error", e);
+    setStatus("WebSocket error (see console).");
+  };
+
+  ws.onclose = (e) => {
+    setStatus("WebSocket closed.");
+    console.warn("ws closed", e);
+  };
+}
+
+/* Start on load */
+startWebSocket();
+
+/* ============================
+   UI controls
+   ============================ */
+document.getElementById('btnPause').addEventListener('click', () => {
+  paused = !paused;
+  document.getElementById('btnPause').textContent = paused ? 'Resume' : 'Pause';
+  setStatus(paused ? 'Paused' : 'Running');
+});
+
+document.getElementById('btnClear').addEventListener('click', () => {
+  chartData.datasets[0].data = [];
+  derivativeSeries.length = 0;
+  derivChart.update();
+  setStatus('Cleared chart data');
+});
+</script>
+</body>
+</html>
